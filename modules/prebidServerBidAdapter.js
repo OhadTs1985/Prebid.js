@@ -37,7 +37,7 @@ const availVendorDefaults = {
     adapter: 'prebidServer',
     cookieSet: false,
     enabled: true,
-    endpoint: '//prebid.adnxs.com/pbs/v1/auction',
+    endpoint: '//prebid.adnxs.com/pbs/v1/openrtb2/auction',
     syncEndpoint: '//prebid.adnxs.com/pbs/v1/cookie_sync',
     timeout: 1000
   },
@@ -96,36 +96,56 @@ function setS2sConfig(options) {
   }
 
   _s2sConfig = options;
-  if (options.syncEndpoint) {
-    queueSync(options.bidders);
-  }
 }
 getConfig('s2sConfig', ({s2sConfig}) => setS2sConfig(s2sConfig));
 
 /**
+ * resets the _synced variable back to false, primiarily used for testing purposes
+*/
+export function resetSyncedStatus() {
+  _synced = false;
+}
+
+/**
  * @param  {Array} bidderCodes list of bidders to request user syncs for.
  */
-function queueSync(bidderCodes) {
+function queueSync(bidderCodes, gdprConsent) {
   if (_synced) {
     return;
   }
   _synced = true;
-  const payload = JSON.stringify({
+
+  const payload = {
     uuid: utils.generateUUID(),
     bidders: bidderCodes
-  });
-  ajax(_s2sConfig.syncEndpoint, (response) => {
-    try {
-      response = JSON.parse(response);
-      response.bidder_status.forEach(bidder => doBidderSync(bidder.usersync.type, bidder.usersync.url, bidder.bidder));
-    } catch (e) {
-      utils.logError(e);
+  };
+
+  if (gdprConsent) {
+    // only populate gdpr field if we know CMP returned consent information (ie didn't timeout or have an error)
+    if (gdprConsent.consentString) {
+      payload.gdpr = (gdprConsent.gdprApplies) ? 1 : 0;
     }
-  },
-  payload, {
-    contentType: 'text/plain',
-    withCredentials: true
-  });
+    // attempt to populate gdpr_consent if we know gdprApplies or it may apply
+    if (gdprConsent.gdprApplies !== false) {
+      payload.gdpr_consent = gdprConsent.consentString;
+    }
+  }
+  const jsonPayload = JSON.stringify(payload);
+
+  ajax(_s2sConfig.syncEndpoint,
+    (response) => {
+      try {
+        response = JSON.parse(response);
+        response.bidder_status.forEach(bidder => doBidderSync(bidder.usersync.type, bidder.usersync.url, bidder.bidder));
+      } catch (e) {
+        utils.logError(e);
+      }
+    },
+    jsonPayload,
+    {
+      contentType: 'text/plain',
+      withCredentials: true
+    });
 }
 
 /**
@@ -304,7 +324,7 @@ function transformHeightWidth(adUnit) {
  */
 const LEGACY_PROTOCOL = {
 
-  buildRequest(s2sBidRequest, adUnits) {
+  buildRequest(s2sBidRequest, bidRequests, adUnits) {
     // pbs expects an ad_unit.video attribute if the imp is video
     adUnits.forEach(adUnit => {
       adUnit.sizes = transformHeightWidth(adUnit);
@@ -348,9 +368,6 @@ const LEGACY_PROTOCOL = {
     if (result.status === 'OK' || result.status === 'no_cookie') {
       if (result.bidder_status) {
         result.bidder_status.forEach(bidder => {
-          if (bidder.no_cookie) {
-            doBidderSync(bidder.usersync.type, bidder.usersync.url, bidder.bidder);
-          }
           if (bidder.error) {
             utils.logWarn(`Prebid Server returned error: '${bidder.error}' for ${bidder.bidder}`);
           }
@@ -437,7 +454,7 @@ const OPEN_RTB_PROTOCOL = {
 
   bidMap: {},
 
-  buildRequest(s2sBidRequest, adUnits) {
+  buildRequest(s2sBidRequest, bidRequests, adUnits) {
     let imps = [];
     let aliases = {};
 
@@ -530,6 +547,35 @@ const OPEN_RTB_PROTOCOL = {
       request.ext = { prebid: { aliases } };
     }
 
+    if (bidRequests && bidRequests[0].gdprConsent) {
+      // note - gdprApplies & consentString may be undefined in certain use-cases for consentManagement module
+      let gdprApplies;
+      if (typeof bidRequests[0].gdprConsent.gdprApplies === 'boolean') {
+        gdprApplies = bidRequests[0].gdprConsent.gdprApplies ? 1 : 0;
+      }
+
+      if (request.regs) {
+        if (request.regs.ext) {
+          request.regs.ext.gdpr = gdprApplies;
+        } else {
+          request.regs.ext = { gdpr: gdprApplies };
+        }
+      } else {
+        request.regs = { ext: { gdpr: gdprApplies } };
+      }
+
+      let consentString = bidRequests[0].gdprConsent.consentString;
+      if (request.user) {
+        if (request.user.ext) {
+          request.user.ext.consent = consentString;
+        } else {
+          request.user.ext = { consent: consentString };
+        }
+      } else {
+        request.user = { ext: { consent: consentString } };
+      }
+    }
+
     return request;
   },
 
@@ -608,7 +654,7 @@ const OPEN_RTB_PROTOCOL = {
  * const bids = protocol().interpretResponse(response, bidRequests, requestedBidders);
  */
 const protocolAdapter = () => {
-  const OPEN_RTB_PATH = 'openrtb2/auction';
+  const OPEN_RTB_PATH = '/openrtb2/';
 
   const endpoint = (_s2sConfig && _s2sConfig.endpoint) || '';
   const isOpenRtb = ~endpoint.indexOf(OPEN_RTB_PATH);
@@ -637,7 +683,12 @@ export function PrebidServer() {
       .reduce(utils.flatten)
       .filter(utils.uniques);
 
-    const request = protocolAdapter().buildRequest(s2sBidRequest, adUnitsWithSizes);
+    if (_s2sConfig && _s2sConfig.syncEndpoint) {
+      let consent = (Array.isArray(bidRequests) && bidRequests.length > 0) ? bidRequests[0].gdprConsent : undefined;
+      queueSync(_s2sConfig.bidders, consent);
+    }
+
+    const request = protocolAdapter().buildRequest(s2sBidRequest, bidRequests, adUnitsWithSizes);
     const requestJson = JSON.stringify(request);
 
     ajax(
