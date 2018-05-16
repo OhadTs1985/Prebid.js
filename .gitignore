@@ -80,3 +80,4 @@ typings/
 
 #Used modules
 modules.json
+modules-legacy.json
